@@ -5,53 +5,44 @@ const cheerio = require("cheerio");
 const TMDB_API_KEY = "d659c9a6006168cfeee99cd51cad6623";
 const IMDB_PROFILE_ID = "p.k7ky5tvxj7vurvtblpjto6ck2a";
 
-// Manifest with 4 distinct catalog rows
+// 10 Curated Catalogs
 const manifest = {
-    "id": "org.myself.imdb.multi.picks",
-    "version": "1.2.0",
-    "name": "IMDb Dynamic Multi-Curator",
-    "description": "Dynamic, personalized multi-catalog recommendations tailored to your taste",
+    "id": "org.myself.imdb.tasteprofile.curator",
+    "version": "2.0.0",
+    "name": "TasteProfile 10-Catalog Engine",
+    "description": "Multi-tier personalized catalogs: Mind-bending, Hidden Gems, Prestige Sci-Fi, and Noir.",
     "resources": ["catalog"],
-    "types": ["movie"],
+    "types": ["movie", "series"],
     "catalogs": [
-        {
-            "type": "movie",
-            "id": "recs_seed_1",
-            "name": "🎬 Spotlight Pick A"
-        },
-        {
-            "type": "movie",
-            "id": "recs_seed_2",
-            "name": "🍿 Spotlight Pick B"
-        },
-        {
-            "type": "movie",
-            "id": "recs_high_rated",
-            "name": "💎 High-Rated Taste Matches"
-        },
-        {
-            "type": "movie",
-            "id": "recs_wildcard",
-            "name": "🎲 Dynamic Wildcard"
-        }
+        { "type": "movie", "id": "cat_mind_bending", "name": "🧠 Mind-Bending & High-Concept" },
+        { "type": "movie", "id": "cat_psych_thriller", "name": "🕵️ Psychological & Tense Thrillers" },
+        { "type": "movie", "id": "cat_hidden_gems", "name": "💎 Hidden Gems (Under-The-Radar)" },
+        { "type": "movie", "id": "cat_space_scifi", "name": "🌌 Hard Sci-Fi & Space Realism" },
+        { "type": "movie", "id": "cat_masterpieces", "name": "🏆 Modern Masterpieces (8.0+)" },
+        { "type": "movie", "id": "cat_dark_noir", "name": "🌪️ Dark Neo-Noir & Gritty Crime" },
+        { "type": "movie", "id": "cat_timeloop_reality", "name": "⏳ Non-Linear & Alternate Realities" },
+        { "type": "movie", "id": "cat_director_vision", "name": "🎬 Visionary Auteur Cinema" },
+        { "type": "movie", "id": "cat_smart_wildcard", "name": "🎲 Smart Taste Wildcard" },
+        { "type": "series", "id": "cat_prestige_series", "name": "📺 Prestige Miniseries & Drama" }
     ],
     "idPrefixes": ["tt"]
 };
 
 const builder = new addonBuilder(manifest);
 
-// High-grade fallback seeds in case of transient IMDb rate limits
-const FALLBACK_SEEDS = [
-    { imdbId: "tt1375666", title: "Inception" },
-    { imdbId: "tt0816692", title: "Interstellar" },
-    { imdbId: "tt0468569", title: "The Dark Knight" },
-    { imdbId: "tt0110912", title: "Pulp Fiction" },
-    { imdbId: "tt0137523", title: "Fight Club" },
-    { imdbId: "tt0111161", title: "The Shawshank Redemption" }
-];
+// High-grade fallback seeds
+const FALLBACK_FAVORITES = ["tt1375666", "tt0816692", "tt0468569", "tt0110912", "tt0137523", "tt0111161", "tt0062622", "tt2096673"];
 
-// Helper: Scrape ratings from IMDb profile
-async function fetchImdbRatedTitles(userId) {
+// Cache scraped IDs briefly in-memory to keep serverless responses fast
+let cachedRatedIds = null;
+let lastFetch = 0;
+
+async function getRatedImdbIds(userId) {
+    const now = Date.now();
+    if (cachedRatedIds && (now - lastFetch < 1000 * 60 * 30)) {
+        return cachedRatedIds;
+    }
+
     try {
         const url = `https://www.imdb.com/user/${userId}/ratings/`;
         const { data } = await axios.get(url, {
@@ -59,132 +50,120 @@ async function fetchImdbRatedTitles(userId) {
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept-Language": "en-US,en;q=0.9"
             },
-            timeout: 5000
+            timeout: 4500
         });
 
         const $ = cheerio.load(data);
-        const ratedItems = [];
-        const seen = new Set();
-
+        const ids = [];
         $('a[href*="/title/tt"]').each((_, el) => {
             const href = $(el).attr("href");
             const match = href ? href.match(/tt\d{7,8}/) : null;
-            const text = $(el).text().trim();
-            if (match && !seen.has(match[0])) {
-                seen.add(match[0]);
-                ratedItems.push({ imdbId: match[0], title: text || "your rated film" });
-            }
+            if (match && !ids.includes(match[0])) ids.push(match[0]);
         });
 
-        return ratedItems.length > 0 ? ratedItems : FALLBACK_SEEDS;
-    } catch (err) {
-        console.warn("IMDb fetch fallback:", err.message);
-        return FALLBACK_SEEDS;
+        cachedRatedIds = ids.length > 0 ? ids : FALLBACK_FAVORITES;
+        lastFetch = now;
+        return cachedRatedIds;
+    } catch {
+        return FALLBACK_FAVORITES;
     }
 }
 
-// Helper: Get TMDB movie details and recommendations
-async function getTmdbRecs(imdbId) {
-    try {
-        const findRes = await axios.get(
-            `https://api.themoviedb.org/3/find/${imdbId}?api_key=${TMDB_API_KEY}&external_source=imdb_id`,
-            { timeout: 3500 }
-        );
-        const tmdbMovie = findRes.data.movie_results?.[0];
-        if (!tmdbMovie) return { seedTitle: "", recs: [] };
-
-        const recsRes = await axios.get(
-            `https://api.themoviedb.org/3/movie/${tmdbMovie.id}/recommendations?api_key=${TMDB_API_KEY}`,
-            { timeout: 3500 }
-        );
-
-        return {
-            seedTitle: tmdbMovie.title,
-            recs: recsRes.data.results || []
-        };
-    } catch (e) {
-        return { seedTitle: "", recs: [] };
-    }
-}
-
-// Helper: Resolve TMDB items to IMDb IDs for native Stremio compatibility
-async function formatMetas(tmdbMovies, limit = 20) {
-    const selected = tmdbMovies.slice(0, limit);
+// Convert TMDB discover results into Stremio metas with IMDb IDs
+async function resolveToStremioMetas(results, isSeries = false, limit = 18) {
     const metas = [];
+    const sliced = results.slice(0, limit);
 
-    for (const movie of selected) {
+    for (const item of sliced) {
         try {
-            // Get external IDs to retrieve the IMDb ID (tt...)
+            const endpoint = isSeries ? "tv" : "movie";
             const extRes = await axios.get(
-                `https://api.themoviedb.org/3/movie/${movie.id}/external_ids?api_key=${TMDB_API_KEY}`,
-                { timeout: 2500 }
+                `https://api.themoviedb.org/3/${endpoint}/${item.id}/external_ids?api_key=${TMDB_API_KEY}`,
+                { timeout: 2000 }
             );
             const imdbId = extRes.data.imdb_id;
             if (!imdbId) continue;
 
             metas.push({
                 id: imdbId,
-                type: "movie",
-                name: movie.title,
-                poster: movie.poster_path ? `https://image.tmdb.org/t/p/w500${movie.poster_path}` : null,
-                description: movie.overview,
-                releaseInfo: movie.release_date ? movie.release_date.split("-")[0] : ""
+                type: isSeries ? "series" : "movie",
+                name: isSeries ? item.name : item.title,
+                poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
+                description: item.overview,
+                releaseInfo: (item.release_date || item.first_air_date || "").split("-")[0]
             });
         } catch {
-            // Skip item if external ID lookup drops
+            // Drop cleanly if external ID lookup fails
         }
     }
     return metas;
 }
 
 builder.defineCatalogHandler(async ({ type, id }) => {
-    if (type !== "movie") return { metas: [] };
-
     try {
-        const ratedList = await fetchImdbRatedTitles(IMDB_PROFILE_ID);
-        const randomItem = (arr) => arr[Math.floor(Math.random() * arr.length)];
+        const ratedIds = await getRatedImdbIds(IMDB_PROFILE_ID);
+        const ratedSet = new Set(ratedIds);
 
-        // --- CATALOG 1: Spotlight Seed A ---
-        if (id === "recs_seed_1") {
-            const seed = randomItem(ratedList);
-            const { recs } = await getTmdbRecs(seed.imdbId);
-            const metas = await formatMetas(recs, 15);
-            return { metas };
+        let queryUrl = "";
+        let isSeries = (type === "series");
+
+        // --- CATALOG ROUTING BY DISCOVER QUERIES ---
+
+        if (id === "cat_mind_bending") {
+            // Sci-Fi (878) + Mystery (9648), high ratings, good vote volume
+            queryUrl = `https://api.themoviedb.org/3/discover/movie?api_key=${TMDB_API_KEY}&with_genres=878,9648&vote_average.gte=7.3&vote_count.gte=800&sort_by=vote_average.desc`;
+        } 
+        else if (id === "cat_psych_thriller") {
+            // Thriller (53) + Mystery (9648) or Crime (80)
+            queryUrl = `https://api.themoviedb.org/3/discover/movie?api_key=${TMDB_API_KEY}&with_genres=53,9648&without_genres=28,12&vote_average.gte=7.4&vote_count.gte=1000&sort_by=vote_average.desc`;
+        } 
+        else if (id === "cat_hidden_gems") {
+            // High score (7.5 - 8.6), moderate vote count (300 - 4500) to filter out blockbusters
+            queryUrl = `https://api.themoviedb.org/3/discover/movie?api_key=${TMDB_API_KEY}&vote_average.gte=7.5&vote_count.gte=300&vote_count.lte=4500&sort_by=vote_average.desc`;
+        } 
+        else if (id === "cat_space_scifi") {
+            // Sci-Fi (878), keywords around space/astronautics/speculative
+            queryUrl = `https://api.themoviedb.org/3/discover/movie?api_key=${TMDB_API_KEY}&with_genres=878&with_keywords=9882|3801|161176|14901&vote_average.gte=7.2&vote_count.gte=500&sort_by=vote_average.desc`;
+        } 
+        else if (id === "cat_masterpieces") {
+            // Universally acclaimed across drama, crime, and sci-fi
+            queryUrl = `https://api.themoviedb.org/3/discover/movie?api_key=${TMDB_API_KEY}&vote_average.gte=8.1&vote_count.gte=2500&sort_by=vote_average.desc`;
+        } 
+        else if (id === "cat_dark_noir") {
+            // Crime (80) + Thriller (53)
+            queryUrl = `https://api.themoviedb.org/3/discover/movie?api_key=${TMDB_API_KEY}&with_genres=80,53&vote_average.gte=7.4&vote_count.gte=800&sort_by=popularity.desc`;
+        } 
+        else if (id === "cat_timeloop_reality") {
+            // Sci-Fi or Fantasy dealing with time distortion, parallel worlds
+            queryUrl = `https://api.themoviedb.org/3/discover/movie?api_key=${TMDB_API_KEY}&with_genres=878&with_keywords=4379|1930|9882&vote_average.gte=7.0&vote_count.gte=400&sort_by=vote_average.desc`;
+        } 
+        else if (id === "cat_director_vision") {
+            // Deep dive on modern auteur cinema (Nolan, Denis Villeneuve, Fincher, Kubrick style pool)
+            queryUrl = `https://api.themoviedb.org/3/discover/movie?api_key=${TMDB_API_KEY}&with_people=525|137427|7467|240|5655&vote_average.gte=7.6&sort_by=vote_average.desc`;
+        } 
+        else if (id === "cat_smart_wildcard") {
+            // Randomized page offset (1-5) on top-tier thriller/sci-fi to keep it dynamic every refresh
+            const randomPage = Math.floor(Math.random() * 5) + 1;
+            queryUrl = `https://api.themoviedb.org/3/discover/movie?api_key=${TMDB_API_KEY}&with_genres=878|53|9648&vote_average.gte=7.5&vote_count.gte=1200&page=${randomPage}&sort_by=vote_average.desc`;
+        } 
+        else if (id === "cat_prestige_series") {
+            // High-rating TV miniseries / drama
+            queryUrl = `https://api.themoviedb.org/3/discover/tv?api_key=${TMDB_API_KEY}&with_genres=18,9648&vote_average.gte=8.0&vote_count.gte=400&sort_by=vote_average.desc`;
         }
 
-        // --- CATALOG 2: Spotlight Seed B ---
-        if (id === "recs_seed_2") {
-            const seed = randomItem(ratedList);
-            const { recs } = await getTmdbRecs(seed.imdbId);
-            const metas = await formatMetas(recs, 15);
-            return { metas };
-        }
+        if (!queryUrl) return { metas: [] };
 
-        // --- CATALOG 3: High-Rated Matches (Score >= 7.5) ---
-        if (id === "recs_high_rated") {
-            const seed = randomItem(ratedList);
-            const { recs } = await getTmdbRecs(seed.imdbId);
-            const highRated = recs.filter(m => (m.vote_average || 0) >= 7.5);
-            const metas = await formatMetas(highRated.length >= 5 ? highRated : recs, 15);
-            return { metas };
-        }
+        const { data } = await axios.get(queryUrl, { timeout: 3500 });
+        const rawResults = data.results || [];
 
-        // --- CATALOG 4: Dynamic Wildcard (Combined Pool) ---
-        if (id === "recs_wildcard") {
-            const seedA = randomItem(ratedList);
-            const seedB = randomItem(ratedList);
-            const [resA, resB] = await Promise.all([
-                getTmdbRecs(seedA.imdbId),
-                getTmdbRecs(seedB.imdbId)
-            ]);
-            const combined = [...resA.recs, ...resB.recs].sort(() => 0.5 - Math.random());
-            const metas = await formatMetas(combined, 15);
-            return { metas };
-        }
+        // Exclude titles you have already rated on IMDb
+        const unratedCandidates = rawResults.filter(item => !ratedSet.has(item.id));
 
-        return { metas: [] };
+        const metas = await resolveToStremioMetas(unratedCandidates, isSeries, 18);
+        return { metas };
+
     } catch (err) {
-        console.error("Catalog Handler Error:", err.message);
+        console.error(`Catalog error on ${id}:`, err.message);
         return { metas: [] };
     }
 });
